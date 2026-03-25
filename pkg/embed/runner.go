@@ -192,6 +192,59 @@ func (r *EmbeddedRunner) Destroy(ctx context.Context, ws *Workspace, vars map[st
 	return r.runApplyOrDestroy(ctx, ws, vars, true, onProgress)
 }
 
+// RefreshOnly runs `tofu apply -refresh-only` to update the state file to
+// match current cloud reality without making any infrastructure changes.
+func (r *EmbeddedRunner) RefreshOnly(ctx context.Context, ws *Workspace, vars map[string]string) error {
+	if err := ws.loadStateToDir(ctx); err != nil {
+		return err
+	}
+
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("create stdout pipe: %w", err)
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		return fmt.Errorf("create stderr pipe: %w", err)
+	}
+
+	var capturedErr *ApplyError
+	var captureWg sync.WaitGroup
+	captureWg.Add(1)
+	go func() {
+		defer captureWg.Done()
+		capturedErr = streamApplyJSON(stdoutR, nil)
+	}()
+	go func() { _, _ = io.Copy(io.Discard, stderrR) }()
+
+	meta := r.buildMeta(ctx, ws.resolvedDir(), stdoutW, stderrW)
+	args := []string{"-refresh-only", "-json", "-input=false", "-auto-approve", "-no-color"}
+	for k, v := range vars {
+		args = append(args, "-var", k+"="+v)
+	}
+	cmd := &command.ApplyCommand{Meta: meta}
+	code := cmd.Run(args)
+
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+	captureWg.Wait()
+	_ = stdoutR.Close()
+	_ = stderrR.Close()
+
+	if code != 0 {
+		if capturedErr != nil {
+			return capturedErr
+		}
+		return fmt.Errorf("tofu apply -refresh-only failed (exit %d)", code)
+	}
+	if err := ws.saveStateFromDir(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (r *EmbeddedRunner) runApplyOrDestroy(ctx context.Context, ws *Workspace, vars map[string]string, destroy bool, onProgress func(ProgressEvent)) error {
 	if err := ws.loadStateToDir(ctx); err != nil {
 		return err
